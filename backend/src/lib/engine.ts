@@ -9,11 +9,13 @@
  */
 
 import { Keypair } from "@stellar/stellar-sdk";
-import { sendXLM, sendUSDC } from "../stellar/transaction";
+import { sendXLM, sendUSDC, invokeEngineExecute } from "../stellar/transaction";
+import { VAULT_CONTRACT_ID } from "../config/network";
 import { getEngineSecret } from "./secrets";
 
 export { fetchRecentPayments } from "../stellar/horizon";
 export { loadKeypairFromBlob } from "../stellar/keypair";
+export { invokeEngineExecute } from "../stellar/transaction";
 
 type SqlClient = (strings: TemplateStringsArray, ...values: any[]) => Promise<any[]>;
 
@@ -25,19 +27,34 @@ export async function getEngineKeypair(): Promise<typeof Keypair.prototype> {
 
 /**
  * Execute an automated rule transaction.
- * Sends XLM or USDC from the engine account to a destination (vault or user wallet).
  *
- * The asset defaults to XLM so existing 3-argument callers keep working.
- * USDC requires a trustline on both the engine account and the destination —
- * vaults get one at creation time (see stellar/vault.ts).
+ * In Web3 Soroban mode, invokes AutopilotVault.engine_execute(recipient, amount, token_address, memo)
+ * directly on-chain so that smart contract safety controls (pause/unpause, spend limits) are enforced.
+ * Falls back to Classic payment if targeting a raw Classic account.
  */
 export async function executeRuleTransaction(
   destinationId: string,
   amount: string,
   memoText: string,
-  asset: "XLM" | "USDC" = "XLM"
+  asset: "XLM" | "USDC" = "XLM",
+  vaultContractId?: string
 ): Promise<string> {
   const engine = await getEngineKeypair();
+  const targetContractId =
+    vaultContractId ?? (destinationId.startsWith("C") ? destinationId : VAULT_CONTRACT_ID);
+
+  if (targetContractId && targetContractId.startsWith("C")) {
+    const recipient = destinationId.startsWith("C") ? engine.publicKey() : destinationId;
+    return invokeEngineExecute(
+      engine,
+      targetContractId,
+      recipient,
+      amount,
+      memoText,
+      asset
+    );
+  }
+
   return asset === "USDC"
     ? sendUSDC(engine, destinationId, amount, memoText)
     : sendXLM(engine, destinationId, amount, memoText);
