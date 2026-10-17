@@ -29,7 +29,7 @@ async function migrate() {
       "userId"          UUID        NOT NULL REFERENCES "User"(id) ON DELETE CASCADE,
       type              TEXT        NOT NULL CHECK (type IN ('savings', 'investment')),
       "publicKey"       TEXT        NOT NULL UNIQUE,
-      "encryptedSecret" TEXT        NOT NULL,
+      "encryptedSecret" TEXT,
       "xlmBalance"      TEXT        NOT NULL DEFAULT '0.0000000',
       "usdcBalance"     TEXT        NOT NULL DEFAULT '0.0000000',
       "fundTxHash"      TEXT,
@@ -37,6 +37,13 @@ async function migrate() {
       "updatedAt"       TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `;
+
+  // Make encryptedSecret nullable for existing deployments migrating to non-custodial Soroban smart contracts
+  try {
+    await sql`
+      ALTER TABLE "Vault" ALTER COLUMN "encryptedSecret" DROP NOT NULL
+    `;
+  } catch {}
 
   // Index for fast lookups by userId
   await sql`
@@ -54,8 +61,8 @@ async function migrate() {
     ON "Vault" ("userId", type)
   `;
 
-  console.log("✅ Vault table created successfully");
-  console.log("   Columns: id, userId, type, publicKey, encryptedSecret,");
+  console.log("✅ Vault table created / updated successfully (Non-custodial Soroban enabled)");
+  console.log("   Columns: id, userId, type, publicKey, encryptedSecret (nullable),");
   console.log("            xlmBalance, usdcBalance, fundTxHash, createdAt, updatedAt");
   console.log("   Indexes: vault_user_idx, vault_user_type_idx, vault_user_type_unique");
 }

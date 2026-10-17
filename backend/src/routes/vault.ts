@@ -103,7 +103,8 @@ export default async function vaultRoutes(server: FastifyInstance) {
     try {
       const { publicKey, encryptedSecret, fundTxHash } = await createVaultOnChain(
         request.user.id,
-        type as VaultType
+        type as VaultType,
+        request.user.publicKey
       );
 
       const inserted = await sql`
@@ -111,15 +112,17 @@ export default async function vaultRoutes(server: FastifyInstance) {
           (id, "userId", type, "publicKey", "encryptedSecret", "fundTxHash", "createdAt", "updatedAt")
         VALUES
           (gen_random_uuid(), ${request.user.id}::uuid, ${type},
-           ${publicKey}, ${encryptedSecret}, ${fundTxHash}, NOW(), NOW())
+           ${publicKey}, ${encryptedSecret ?? null}, ${fundTxHash}, NOW(), NOW())
         RETURNING id, type, "publicKey", "fundTxHash", "createdAt"
       `;
 
+      const expType = publicKey.startsWith("C") ? "contract" : "account";
+
       return reply.status(201).send({
-        message: `${type} vault created on Stellar ${NETWORK_LABEL}`,
+        message: `${type} vault created on Stellar ${NETWORK_LABEL} (Non-custodial Soroban Vault)`,
         vault: inserted[0],
         fundTxHash,
-        explorerUrl: explorerUrl("tx", fundTxHash),
+        explorerUrl: explorerUrl(expType, publicKey),
       });
     } catch (err: any) {
       console.error("[Vault] ✗ Failed to create %s vault:", type, err?.message);
@@ -194,6 +197,18 @@ export default async function vaultRoutes(server: FastifyInstance) {
 
     if (vaults.length === 0) {
       return reply.status(404).send({ error: `No ${type} vault found.` });
+    }
+
+    const vault = vaults[0];
+
+    // For non-custodial Soroban smart contract vaults, server holds no private keys
+    if (!vault.encryptedSecret) {
+      return reply.status(400).send({
+        error:
+          "Vault is non-custodial (Soroban smart contract). Withdrawals require cryptographic authorization from your Web3 wallet.",
+        isNonCustodial: true,
+        contractId: vault.publicKey,
+      });
     }
 
     try {
@@ -284,6 +299,16 @@ export default async function vaultRoutes(server: FastifyInstance) {
     }
 
     const vault = vaults[0];
+
+    // For non-custodial Soroban smart contracts, closing must be signed by the owner
+    if (!vault.encryptedSecret) {
+      return reply.status(400).send({
+        error:
+          "Vault is non-custodial (Soroban smart contract). Closing or draining vault must be initiated and signed by your Web3 wallet.",
+        isNonCustodial: true,
+        contractId: vault.publicKey,
+      });
+    }
 
     try {
       const txHash = await closeVault(
