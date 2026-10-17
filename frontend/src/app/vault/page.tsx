@@ -24,6 +24,7 @@ import {
   Check,
   ArrowRight,
 } from "lucide-react";
+import { isConnected, signTransaction } from "@stellar/freighter-api";
 import DashboardShell from "@/components/DashboardShell";
 import { explorerUrl, ANCHOR_URL, NETWORK_LABEL } from "@/lib/network";
 
@@ -157,14 +158,43 @@ function WithdrawModal({
     setLoading(true);
     setError("");
     try {
-      const res = await fetch(`/api/vault/${vaultType}/withdraw`, {
+      // 1. Check if Freighter wallet is installed and connected
+      const connectedRes = await isConnected();
+      if (!connectedRes?.isConnected) {
+        throw new Error("Freighter wallet is not connected. Please install and unlock the Freighter extension.");
+      }
+
+      // 2. Prepare unsigned Soroban withdrawal transaction from backend
+      const prepRes = await fetch(`/api/vault/${vaultType}/withdraw/prepare`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
         body: JSON.stringify({ asset, amount }),
       });
+      const prepData = await prepRes.json();
+      if (!prepRes.ok) throw new Error(prepData.error || "Failed to prepare withdrawal transaction");
+
+      // 3. Prompt user for cryptographic authorization in Freighter
+      const signRes = await signTransaction(prepData.unsignedTxXdr, {
+        networkPassphrase: prepData.networkPassphrase,
+        accountToSign: destKey || userPublicKey,
+      });
+
+      const signedTxXdr = typeof signRes === "string" ? signRes : signRes?.signedTxXdr;
+      if (!signedTxXdr) {
+        throw new Error(signRes?.error?.message || "Withdrawal signature was rejected in Freighter.");
+      }
+
+      // 4. Submit the cryptographically signed transaction to the backend
+      const res = await fetch(`/api/vault/${vaultType}/withdraw`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ signedTxXdr, asset, amount }),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Withdrawal failed");
+
       onSuccess();
       onClose();
     } catch (e: any) {
@@ -339,6 +369,11 @@ function WithdrawModal({
               </div>
             </div>
 
+            <p className="text-[11px] text-white/40 mb-3 flex items-center gap-1.5">
+              <CheckCircle2 className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+              Web3 non-custodial: You will be prompted to sign the Soroban withdrawal in your Freighter wallet.
+            </p>
+
             {error && (
               <p className="text-red-400 text-xs mb-3 flex items-center gap-1.5">
                 <AlertCircle className="w-3.5 h-3.5 shrink-0" /> {error}
@@ -361,7 +396,7 @@ function WithdrawModal({
                 className="flex-1 py-2.5 rounded-xl bg-white text-black text-xs font-semibold hover:bg-white/90 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
               >
                 {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ArrowDownLeft className="w-3.5 h-3.5" />}
-                {loading ? "Processing…" : "Confirm Withdrawal"}
+                {loading ? "Signing with Freighter…" : "Sign & Confirm Withdrawal"}
               </button>
             </div>
 

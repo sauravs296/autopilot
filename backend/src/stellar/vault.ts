@@ -17,16 +17,32 @@
  *   xlmBalance, usdcBalance, createdAt, updatedAt
  */
 
-import { Asset, Keypair } from "@stellar/stellar-sdk";
+import {
+  Asset,
+  Keypair,
+  Contract,
+  Address,
+  nativeToScVal,
+  TransactionBuilder,
+  BASE_FEE,
+  rpc,
+} from "@stellar/stellar-sdk";
 import { generateVaultKeypair, loadKeypairFromBlob } from "./keypair";
 import {
   fetchAccountBalances,
   fetchXLMBalance,
   fetchUSDCBalance,
   accountExists,
+  loadAccount,
+  submitTransaction,
   explorerUrl,
   USDC_ASSET,
 } from "./horizon";
+import {
+  NETWORK_PASSPHRASE,
+  SOROBAN_RPC_URL,
+  VAULT_CONTRACT_ID,
+} from "../config/network";
 import {
   fundAndTrustlineVault,
   createUSDCTrustline,
@@ -174,6 +190,82 @@ export async function withdrawUSDCFromVault(
 ): Promise<string> {
   const vaultSigner = loadKeypairFromBlob(encryptedSecret);
   return sendUSDC(vaultSigner, toPublicKey, amountUSDC, memo ?? "AutoPilot withdraw");
+}
+
+/**
+ * Prepare an unsigned Soroban smart contract withdraw transaction for client-side wallet signing.
+ * Directly targets AutopilotVault.withdraw(amount, token_address).
+ *
+ * @param vaultPublicKey   Contract ID (C...) of the AutopilotVault
+ * @param ownerPublicKey   Connected user wallet public key (G...)
+ * @param asset            "xlm" | "usdc"
+ * @param amount           Amount as decimal string
+ */
+export async function prepareWithdrawTransaction(
+  vaultPublicKey: string,
+  ownerPublicKey: string,
+  asset: "xlm" | "usdc",
+  amount: string
+): Promise<{ unsignedTxXdr: string; networkPassphrase: string; contractId: string }> {
+  const contractId = vaultPublicKey.startsWith("C") ? vaultPublicKey : VAULT_CONTRACT_ID;
+  const contract = new Contract(contractId);
+
+  const selectedAsset = asset === "usdc" ? USDC_ASSET : Asset.native();
+  const tokenContractId = selectedAsset.contractId(NETWORK_PASSPHRASE);
+
+  const stroops = BigInt(Math.round(parseFloat(amount) * 10_000_000));
+  const account = await loadAccount(ownerPublicKey);
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(
+      contract.call(
+        "withdraw",
+        nativeToScVal(stroops, { type: "i128" }),
+        new Address(tokenContractId).toScVal()
+      )
+    )
+    .setTimeout(180)
+    .build();
+
+  let preparedTx = tx;
+  try {
+    const server = new rpc.Server(SOROBAN_RPC_URL, { allowHttp: true });
+    preparedTx = await server.prepareTransaction(tx);
+  } catch (rpcErr: any) {
+    console.warn("[Vault] Soroban RPC prepare fallback for withdraw:", rpcErr?.message);
+  }
+
+  return {
+    unsignedTxXdr: preparedTx.toXDR(),
+    networkPassphrase: NETWORK_PASSPHRASE,
+    contractId,
+  };
+}
+
+/**
+ * Submit a client-signed withdrawal transaction.
+ *
+ * @param signedTxXdr  Base64 XDR signed by the user's Web3 wallet
+ */
+export async function submitSignedWithdrawTransaction(
+  signedTxXdr: string
+): Promise<string> {
+  const tx = TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
+
+  try {
+    const server = new rpc.Server(SOROBAN_RPC_URL, { allowHttp: true });
+    const sendResponse = await server.sendTransaction(tx);
+    if (sendResponse && sendResponse.hash) {
+      return sendResponse.hash;
+    }
+  } catch (rpcErr: any) {
+    console.warn("[Vault] Soroban RPC submit fallback for withdraw:", rpcErr?.message);
+  }
+
+  return submitTransaction(tx);
 }
 
 /**

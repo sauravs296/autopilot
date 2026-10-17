@@ -21,6 +21,8 @@ import {
   depositUSDCToVault,
   withdrawXLMFromVault,
   withdrawUSDCFromVault,
+  prepareWithdrawTransaction,
+  submitSignedWithdrawTransaction,
   closeVault,
   VaultType,
 } from "../stellar/vault";
@@ -170,16 +172,59 @@ export default async function vaultRoutes(server: FastifyInstance) {
 
   // ── Withdraw from vault ───────────────────────────────────────────────
 
-  server.post("/:type/withdraw", async (request: any, reply: any) => {
+  // ── Prepare withdrawal (Soroban non-custodial wallet sign flow) ───────
+
+  server.post("/:type/withdraw/prepare", async (request: any, reply: any) => {
     const { type } = request.params as { type: string };
     const { asset = "xlm", amount } = request.body as {
       asset?: "xlm" | "usdc";
       amount: string;
     };
 
-    if (!amount || isNaN(parseFloat(amount))) {
-      return reply.status(400).send({ error: "amount is required and must be a number" });
+    if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+      return reply.status(400).send({ error: "amount is required and must be a positive number" });
     }
+
+    const sql = getDb();
+    const vaults = await sql`
+      SELECT "publicKey" FROM "Vault"
+      WHERE "userId" = ${request.user.id}::uuid AND type = ${type}
+      LIMIT 1
+    `;
+
+    if (vaults.length === 0) {
+      return reply.status(404).send({ error: `No ${type} vault found.` });
+    }
+
+    try {
+      const prepared = await prepareWithdrawTransaction(
+        vaults[0].publicKey as string,
+        request.user.publicKey,
+        asset,
+        parseFloat(amount).toFixed(7)
+      );
+
+      return reply.send({
+        success: true,
+        type,
+        asset,
+        amount,
+        unsignedTxXdr: prepared.unsignedTxXdr,
+        networkPassphrase: prepared.networkPassphrase,
+        contractId: prepared.contractId,
+      });
+    } catch (err: any) {
+      return reply.status(500).send({ error: err?.message });
+    }
+  });
+
+  // ── Execute/Submit withdrawal (Requires Web3 wallet cryptographic signature) ──
+
+  server.post("/:type/withdraw", async (request: any, reply: any) => {
+    const { type } = request.params as { type: string };
+    const { signedTxXdr } = (request.body ?? {}) as {
+      signedTxXdr?: string;
+    };
 
     const sql = getDb();
     const vaults = await sql`
@@ -192,33 +237,27 @@ export default async function vaultRoutes(server: FastifyInstance) {
       return reply.status(404).send({ error: `No ${type} vault found.` });
     }
 
-    const vault = vaults[0];
-
-    try {
-      let txHash: string;
-
-      if (asset === "usdc") {
-        txHash = await withdrawUSDCFromVault(
-          vault.encryptedSecret as string,
-          request.user.publicKey,
-          parseFloat(amount).toFixed(7)
-        );
-      } else {
-        txHash = await withdrawXLMFromVault(
-          vault.encryptedSecret as string,
-          request.user.publicKey,
-          parseFloat(amount).toFixed(7)
-        );
+    // Web3 cryptographic authorization: submit the user's wallet-signed transaction
+    if (signedTxXdr) {
+      try {
+        const txHash = await submitSignedWithdrawTransaction(signedTxXdr);
+        return reply.send({
+          success: true,
+          txHash,
+          explorerUrl: explorerUrl("tx", txHash),
+        });
+      } catch (err: any) {
+        return reply.status(500).send({ error: `Transaction submission failed: ${err?.message}` });
       }
-
-      return reply.send({
-        success: true,
-        txHash,
-        explorerUrl: explorerUrl("tx", txHash),
-      });
-    } catch (err: any) {
-      return reply.status(500).send({ error: err?.message });
     }
+
+    // Unsigned withdrawals are strictly rejected to prevent session hijacking and Web2 bypass
+    return reply.status(400).send({
+      error:
+        "Cryptographic authorization required: Vault withdrawals must be signed using your connected Web3 wallet (Freighter). " +
+        "Call /api/vault/:type/withdraw/prepare to prepare the unsigned transaction, sign with Freighter, and submit signedTxXdr.",
+      requiresSignature: true,
+    });
   });
 
   // ── Close vault ───────────────────────────────────────────────────────
