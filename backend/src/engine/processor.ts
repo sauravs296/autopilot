@@ -19,7 +19,7 @@ import { Worker, Job } from "bullmq";
 import { getDb } from "../lib/db";
 import { claimPayment, executeRuleTransaction } from "../lib/engine";
 import { doesPaymentMatchTrigger } from "../lib/paymentTrigger";
-import { checkSpendingLimit, recordSpend } from "./limitGuard";
+import { checkSpendingLimit, recordSpend, rollbackSpend } from "./limitGuard";
 import { PAYMENT_QUEUE_NAME, PaymentJobData, CronJobData, CRON_QUEUE_NAME, getConnectionOptions } from "./queue";
 
 /**
@@ -98,18 +98,6 @@ export async function processPaymentDirect(data: PaymentJobData): Promise<any> {
 
     const execAmountStr = execAmount.toFixed(7);
 
-    // ── Spending limit check (best-effort — skips gracefully if Redis down)
-    try {
-      const { allowed, reason } = await checkSpendingLimit(userId, execAmount, dailyLimit, weeklyLimit);
-      if (!allowed) {
-        console.log(`[Processor] 🚫 Limit blocked rule ${rule.id}: ${reason}`);
-        results.push({ ruleId: rule.id, status: "blocked", reason });
-        continue;
-      }
-    } catch (limitErr: any) {
-      console.warn("[Processor] ⚠ Limit check skipped (Redis unavailable):", limitErr?.message);
-    }
-
     // ── Determine destination vault
     const action = (rule.action as string).toLowerCase();
     let destination: string | null = null;
@@ -133,6 +121,22 @@ export async function processPaymentDirect(data: PaymentJobData): Promise<any> {
         console.log(`[Processor] ⏭ Already processed ${paymentHorizonId.slice(0, 16)}… — skipping`);
         return { skipped: true, reason: "duplicate" };
       }
+    }
+
+    // ── Spending limit check (fail-closed, atomic reservation prevents TOCTOU race conditions)
+    let limitReserved = false;
+    try {
+      const limitCheck = await checkSpendingLimit(userId, execAmount, dailyLimit, weeklyLimit);
+      if (!limitCheck.allowed) {
+        console.log(`[Processor] 🚫 Limit blocked rule ${rule.id}: ${limitCheck.reason}`);
+        results.push({ ruleId: rule.id, status: "blocked", reason: limitCheck.reason });
+        continue;
+      }
+      limitReserved = limitCheck.reserved ?? false;
+    } catch (limitErr: any) {
+      console.error("[Processor] 🚫 Spending limit check error (failing closed):", limitErr?.message);
+      results.push({ ruleId: rule.id, status: "blocked", reason: `Spending limit verification failed: ${limitErr?.message}` });
+      continue;
     }
 
     const memo = (rule.memo as string | null) ?? `AutoPilot:${action}`.slice(0, 28);
@@ -176,12 +180,21 @@ export async function processPaymentDirect(data: PaymentJobData): Promise<any> {
         console.warn(`[Processor] ⚠ Could not update goal for rule ${rule.id}:`, goalErr?.message);
       }
 
-      try { await recordSpend(userId, execAmount); } catch {}
+      // If spend was not pre-reserved via checkSpendingLimit, record now
+      if (!limitReserved) {
+        try { await recordSpend(userId, execAmount); } catch {}
+      }
 
       console.log(`[Processor] ✅ Rule "${rule.action}" | ${execAmountStr} ${assetCode} → vault | tx: ${txHash.slice(0, 20)}…`);
       results.push({ ruleId: rule.id, status: "executed", txHash, amount: execAmountStr, asset: assetCode, destination });
 
     } catch (txErr: any) {
+      // Transaction failed — roll back reserved spend in Redis
+      if (limitReserved) {
+        await rollbackSpend(userId, execAmount).catch((rbErr) =>
+          console.error(`[Processor] ⚠ Failed to rollback spend for rule ${rule.id}:`, rbErr?.message)
+        );
+      }
       console.error(`[Processor] ✗ Tx failed for rule ${rule.id}:`, txErr?.message ?? txErr);
       results.push({ ruleId: rule.id, status: "failed", error: txErr?.message });
     }
@@ -211,15 +224,22 @@ async function processCronJob(job: Job<CronJobData>) {
   if (userRows.length === 0) return { skipped: true, reason: "user_not_found" };
 
   const user = userRows[0];
-  const { allowed, reason } = await checkSpendingLimit(
-    userId, execAmount,
-    user.dailyLimit ? parseFloat(user.dailyLimit) : null,
-    user.weeklyLimit ? parseFloat(user.weeklyLimit) : null
-  );
+  let limitReserved = false;
+  try {
+    const limitCheck = await checkSpendingLimit(
+      userId, execAmount,
+      user.dailyLimit ? parseFloat(user.dailyLimit) : null,
+      user.weeklyLimit ? parseFloat(user.weeklyLimit) : null
+    );
 
-  if (!allowed) {
-    console.log(`[Processor] 🚫 Cron rule ${ruleId} blocked: ${reason}`);
-    return { status: "blocked", reason };
+    if (!limitCheck.allowed) {
+      console.log(`[Processor] 🚫 Cron rule ${ruleId} blocked: ${limitCheck.reason}`);
+      return { status: "blocked", reason: limitCheck.reason };
+    }
+    limitReserved = limitCheck.reserved ?? false;
+  } catch (limitErr: any) {
+    console.error(`[Processor] 🚫 Cron rule ${ruleId} blocked due to limit verification error (failing closed):`, limitErr?.message);
+    return { status: "blocked", reason: `Spending limit verification error: ${limitErr?.message}` };
   }
 
   const destination = process.env.AUTOPILOT_PUBLIC_KEY!;
@@ -246,10 +266,17 @@ async function processCronJob(job: Job<CronJobData>) {
       }
       throw insertErr;
     }
-    try { await recordSpend(userId, execAmount); } catch {}
+    if (!limitReserved) {
+      try { await recordSpend(userId, execAmount); } catch {}
+    }
     console.log(`[Processor] ✅ Cron rule "${action}" | ${execAmountStr} ${cronAsset} | tx: ${txHash.slice(0, 20)}…`);
     return { status: "executed", txHash, amount: execAmountStr };
   } catch (err: any) {
+    if (limitReserved) {
+      await rollbackSpend(userId, execAmount).catch((rbErr) =>
+        console.error(`[Processor] ⚠ Failed to rollback spend for cron rule ${ruleId}:`, rbErr?.message)
+      );
+    }
     console.error(`[Processor] ✗ Cron tx failed:`, err?.message);
     throw err;
   }
