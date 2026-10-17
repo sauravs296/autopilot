@@ -44,6 +44,19 @@ const HORIZON_URLS = {
   mainnet: "https://horizon.stellar.org",
 } as const;
 
+const SOROBAN_RPC_URLS = {
+  testnet: "https://soroban-testnet.stellar.org",
+  mainnet: "https://mainnet.sorobanrpc.com",
+} as const;
+
+/**
+ * Default deployed AutopilotVault smart contract ID on testnet.
+ */
+const DEFAULT_VAULT_CONTRACT_IDS = {
+  testnet: "CACYX7GWKABSUFUF5MV5UVRH62F6A2D2SUSAHVC4FTIIKARTIBVUW6BP",
+  mainnet: "",
+} as const;
+
 /**
  * stellar.expert path segment for each network. Note the asymmetry: the
  * explorer calls mainnet "public", not "mainnet" — a routine source of broken
@@ -93,6 +106,14 @@ export const IS_TESTNET = !IS_MAINNET;
 /** Horizon endpoint. Override with HORIZON_URL to use a private instance. */
 export const HORIZON_URL: string = process.env.HORIZON_URL ?? HORIZON_URLS[STELLAR_NETWORK];
 
+/** Soroban RPC endpoint for smart contract interactions. */
+export const SOROBAN_RPC_URL: string =
+  process.env.SOROBAN_RPC_URL ?? SOROBAN_RPC_URLS[STELLAR_NETWORK];
+
+/** Deployed Soroban AutopilotVault smart contract ID. */
+export const VAULT_CONTRACT_ID: string =
+  process.env.VAULT_CONTRACT_ID ?? DEFAULT_VAULT_CONTRACT_IDS[STELLAR_NETWORK];
+
 export const NETWORK_PASSPHRASE: string = PASSPHRASE[STELLAR_NETWORK];
 
 /** USDC issuer account for the active network. */
@@ -113,12 +134,15 @@ export const ANCHOR_URL: string | null = ANCHOR_URLS[STELLAR_NETWORK];
 export const NETWORK_LABEL: string = STELLAR_NETWORK;
 
 /**
- * Build an explorer URL for a transaction, account, or ledger.
+ * Build an explorer URL for a transaction, account, ledger, or smart contract.
  *
  * Preferred over interpolating EXPLORER_BASE_URL by hand so the network
  * segment is never wrong.
  */
-export function explorerUrl(type: "tx" | "account" | "ledger", id: string): string {
+export function explorerUrl(
+  type: "tx" | "account" | "ledger" | "contract",
+  id: string
+): string {
   return `${EXPLORER_BASE_URL}/${type}/${id}`;
 }
 
@@ -130,6 +154,8 @@ export function networkConfig() {
   return {
     network: STELLAR_NETWORK,
     horizonUrl: HORIZON_URL,
+    sorobanRpcUrl: SOROBAN_RPC_URL,
+    vaultContractId: VAULT_CONTRACT_ID,
     networkPassphrase: NETWORK_PASSPHRASE,
     usdcIssuer: USDC_ISSUER,
     explorerBaseUrl: EXPLORER_BASE_URL,

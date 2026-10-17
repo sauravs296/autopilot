@@ -104,10 +104,10 @@ async function run() {
     const { publicKey: vaultPk, encryptedSecret, fundTxHash } = await createVaultOnChain(userId, "savings");
     await sql`
       INSERT INTO "Vault" (id, "userId", type, "publicKey", "encryptedSecret", "fundTxHash", "createdAt", "updatedAt")
-      VALUES (gen_random_uuid(), ${userId}::uuid, 'savings', ${vaultPk}, ${encryptedSecret}, ${fundTxHash}, NOW(), NOW())
+      VALUES (gen_random_uuid(), ${userId}::uuid, 'savings', ${vaultPk}, ${encryptedSecret ?? null}, ${fundTxHash}, NOW(), NOW())
     `;
-    console.log(`   ✅ Vault created on-chain!`);
-    console.log(`   🔑 Vault address: ${vaultPk.slice(0, 12)}…`);
+    console.log(`   ✅ Non-custodial Soroban vault initialized on-chain!`);
+    console.log(`   🔑 Vault contract ID: ${vaultPk.slice(0, 12)}…`);
     console.log(`   🔗 Fund tx: ${explorerUrl("tx", fundTxHash)}\n`);
 
     // Check initial vault balance

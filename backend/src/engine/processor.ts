@@ -61,7 +61,7 @@ export async function processPaymentDirect(data: PaymentJobData): Promise<any> {
 
   // ── Step 3: Fetch vaults
   const vaults = await sql`
-    SELECT type, "publicKey", "encryptedSecret" FROM "Vault"
+    SELECT type, "publicKey" FROM "Vault"
     WHERE "userId" = ${userId}::uuid
   `;
   const savingsVault = vaults.find((v: any) => v.type === "savings");
